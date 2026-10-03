@@ -397,7 +397,7 @@
       <button class="btn-ghost" id="export-data-btn" style="flex:1; font-size:11px; padding:6px 8px;">Save Your File</button>
       <button class="btn-ghost" id="import-data-btn" style="flex:1; font-size:11px; padding:6px 8px;">Open Your Saved File</button>
     </div>
-    <input type="file" id="import-file-input" accept=".json" style="display:none;">
+    <input type="file" id="import-file-input" accept=".json,application/json,text/plain,application/octet-stream" style="display:none;">
     <p class="error-text" id="backup-status" style="margin-top:6px; font-size:11px;"></p>
   </div>
 
@@ -686,7 +686,7 @@
       <p class="error-text" id="refresh-closed-status"></p>
       <button class="btn-ghost" id="download-csv-btn" style="width:100%; margin-bottom:8px;">Download CSV</button>
       <button class="btn-ghost" id="import-csv-btn" style="width:100%; margin-bottom:10px;">Import CSV</button>
-      <input type="file" id="import-csv-input" accept=".csv" style="display:none;">
+      <input type="file" id="import-csv-input" accept=".csv,text/csv,text/comma-separated-values,text/plain,application/vnd.ms-excel" style="display:none;">
       <p class="error-text" id="import-csv-status"></p>
       <div id="journal-list"></div>
     </div>
@@ -2799,30 +2799,63 @@ document.getElementById('wl-refresh-all').addEventListener('click', async () => 
 
 document.getElementById('export-data-btn').addEventListener('click', async () => {
   const status = document.getElementById('backup-status');
+  status.style.display = 'block';
+  let blob, fileName;
   try {
     const backup = {
+      app: '7-figure-saga',
+      version: 2,
       exportedAt: new Date().toISOString(),
       profile,
       trades,
       tokenMeta,
       watchlist,
-      sizingLog
+      sizingLog,
+      thesisLog,
+      portfolioSnapshots
     };
-    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const dateStr = new Date().toISOString().slice(0, 10);
+    fileName = `7-figure-saga-backup-${dateStr}.json`;
+    blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+  } catch(e) {
+    status.textContent = 'Could not create a backup file.';
+    return;
+  }
+
+  // On phones, the share sheet is the reliable way to get a file saved
+  // (iOS: "Save to Files", Android: Drive, Files, etc).
+  const isTouch = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  if (isTouch && navigator.canShare){
+    try {
+      const file = new File([blob], fileName, { type: 'application/json' });
+      if (navigator.canShare({ files: [file] })){
+        await navigator.share({ files: [file], title: '7 Figure Saga backup' });
+        status.textContent = 'Backup shared. Pick "Save to Files" (or Drive) to keep it.';
+        return;
+      }
+    } catch(e) {
+      if (e && e.name === 'AbortError'){
+        status.textContent = 'Save cancelled.';
+        return;
+      }
+      // anything else: fall through to a normal download
+    }
+  }
+
+  try {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    const dateStr = new Date().toISOString().slice(0, 10);
     a.href = url;
-    a.download = `7-figure-saga-backup-${dateStr}.json`;
+    a.download = fileName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    // Mobile browsers need the link alive for a moment after the click,
+    // revoking right away can cancel the download.
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
     status.textContent = 'Backup downloaded.';
-    status.style.display = 'block';
   } catch(e) {
     status.textContent = 'Could not create a backup file.';
-    status.style.display = 'block';
   }
 });
 
@@ -2834,26 +2867,37 @@ document.getElementById('import-file-input').addEventListener('change', async (e
   const file = event.target.files[0];
   const status = document.getElementById('backup-status');
   if (!file) return;
+  status.style.display = 'block';
   try {
-    const text = await file.text();
-    const data = JSON.parse(text);
-    if (!data || typeof data !== 'object'){
+    let text = await file.text();
+    text = text.replace(/^\uFEFF/, '').trim();
+    let data;
+    try { data = JSON.parse(text); }
+    catch(err) { throw new Error('That file does not look like a Saga backup.'); }
+    if (!data || typeof data !== 'object' || !(Array.isArray(data.trades) || data.profile || data.userName)){
       throw new Error('That file does not look like a Saga backup.');
     }
+
     trades = Array.isArray(data.trades) ? data.trades : [];
     tokenMeta = (data.tokenMeta && typeof data.tokenMeta === 'object') ? data.tokenMeta : {};
     watchlist = Array.isArray(data.watchlist) ? data.watchlist : [];
     sizingLog = Array.isArray(data.sizingLog) ? data.sizingLog : [];
+    // Older backups did not include these, so only replace them when present.
+    if (data.thesisLog && typeof data.thesisLog === 'object') thesisLog = data.thesisLog;
+    if (Array.isArray(data.portfolioSnapshots)) portfolioSnapshots = data.portfolioSnapshots;
 
     await saveTrades();
     await saveTokenMeta();
     await saveWatchlist();
     await saveSizingLog();
+    await saveThesisLog();
+    await savePortfolioSnapshots();
 
     if (data.userName || data.profile){
       const profileData = data.profile || { name: data.userName, xHandle: '', pfp: '' };
-      await window.storage.set('saga_profile', JSON.stringify(profileData));
-      applyProfileToUI(profileData);
+      profile = Object.assign({ name: '', xHandle: '', pfp: '', finnhubKey: '' }, profileData);
+      await window.storage.set('saga_profile', JSON.stringify(profile));
+      applyProfileToUI(profile);
     }
 
     refreshAll();
@@ -2861,10 +2905,12 @@ document.getElementById('import-file-input').addEventListener('change', async (e
     renderSizingLog();
 
     status.textContent = 'Backup imported successfully.';
-    status.style.display = 'block';
   } catch(e) {
-    status.textContent = e.message || 'Could not read that backup file.';
-    status.style.display = 'block';
+    if (e && e.name === 'QuotaExceededError'){
+      status.textContent = 'This browser ran out of storage space while loading the file. Try a smaller profile picture.';
+    } else {
+      status.textContent = e.message || 'Could not read that backup file.';
+    }
   }
   event.target.value = '';
 });
